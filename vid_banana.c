@@ -76,6 +76,7 @@ void VID_Init(unsigned char *palette)
             bwin_resizable(&win, VID_W, VID_H);
             bwin_clear(&win, BANANA_BLACK);
             bwin_update(&win);
+            bwin_capture_mouse(&win, 1);
         } else {
             Sys_Error("Failed to open Banana OS window for Quake");
         }
@@ -85,6 +86,7 @@ void VID_Init(unsigned char *palette)
 void VID_Shutdown(void)
 {
     if (win_opened) {
+        bwin_capture_mouse(&win, 0);
         bwin_close(&win);
         win_opened = 0;
     }
@@ -283,6 +285,7 @@ void Sys_SendKeyEvents(void)
             }
             break;
         case BANANA_EV_MOUSE_DOWN:
+            bwin_capture_mouse(&win, 1);
             if (ev.button == 1) Key_Event(K_MOUSE1, true);
             else if (ev.button == 2) Key_Event(K_MOUSE2, true);
             else if (ev.button == 3) Key_Event(K_MOUSE3, true);
@@ -292,7 +295,12 @@ void Sys_SendKeyEvents(void)
             else if (ev.button == 2) Key_Event(K_MOUSE2, false);
             else if (ev.button == 3) Key_Event(K_MOUSE3, false);
             break;
+        case BANANA_EV_MOUSE_REL:
+            mouse_x_accum += ev.x;
+            mouse_y_accum += ev.y;
+            break;
         case BANANA_EV_MOUSE_MOVE:
+            // Fallback for kernels without relative mouse capture
             if (last_mx >= 0) {
                 mouse_x_accum += (ev.x - last_mx);
                 mouse_y_accum += (ev.y - last_my);
@@ -300,11 +308,22 @@ void Sys_SendKeyEvents(void)
             last_mx = ev.x;
             last_my = ev.y;
             break;
+        case BANANA_EV_CAPTURE:
+            last_mx = -1;
+            last_my = -1;
+            break;
+        case BANANA_EV_FOCUS:
+            if (ev.x) {
+                bwin_capture_mouse(&win, 1);
+            }
+            last_mx = -1;
+            last_my = -1;
+            break;
         case BANANA_EV_WHEEL:
-            if (ev.button < 0) {
+            if (ev.button < 0 || ev.y < 0) {
                 Key_Event(K_MWHEELUP, true);
                 Key_Event(K_MWHEELUP, false);
-            } else if (ev.button > 0) {
+            } else if (ev.button > 0 || ev.y > 0) {
                 Key_Event(K_MWHEELDOWN, true);
                 Key_Event(K_MWHEELDOWN, false);
             }
@@ -314,6 +333,7 @@ void Sys_SendKeyEvents(void)
             last_my = -1;
             break;
         case BANANA_EV_CLOSE:
+            bwin_capture_mouse(&win, 0);
             Host_Shutdown();
             exit(0);
             break;

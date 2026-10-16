@@ -149,61 +149,6 @@ void Sys_Sleep(void)
 
 qboolean isDedicated = false;
 
-int fscanf(FILE *f, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    int count = 0;
-    while (*fmt) {
-        if (isspace((unsigned char)*fmt)) {
-            fmt++;
-            continue;
-        }
-        if (*fmt == '%') {
-            fmt++;
-            char conv = *fmt++;
-            int c;
-            while ((c = fgetc(f)) != EOF && isspace(c)) ;
-            if (c == EOF) break;
-            ungetc(c, f);
-
-            if (conv == 's') {
-                char *out = va_arg(ap, char*);
-                int n = 0;
-                while ((c = fgetc(f)) != EOF && !isspace(c)) {
-                    out[n++] = (char)c;
-                }
-                out[n] = 0;
-                count++;
-            } else if (conv == 'i' || conv == 'd') {
-                int *out = va_arg(ap, int*);
-                char num[64];
-                int n = 0;
-                while ((c = fgetc(f)) != EOF && !isspace(c) && n < 62) {
-                    num[n++] = (char)c;
-                }
-                num[n] = 0;
-                *out = atoi(num);
-                count++;
-            } else if (conv == 'f') {
-                float *out = va_arg(ap, float*);
-                char num[64];
-                int n = 0;
-                while ((c = fgetc(f)) != EOF && !isspace(c) && n < 62) {
-                    num[n++] = (char)c;
-                }
-                num[n] = 0;
-                *out = (float)atof(num);
-                count++;
-            }
-        } else {
-            fmt++;
-        }
-    }
-    va_end(ap);
-    return count;
-}
-
 void Sys_LowFPPrecision(void)
 {
 }
