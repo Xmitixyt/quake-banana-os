@@ -1,0 +1,7 @@
+name=quake
+title=Quake
+version=1.09
+type=gui
+description=Classic Quake by id Software ported to Banana OS
+author=id Software
+category=Games

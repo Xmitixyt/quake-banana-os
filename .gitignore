@@ -1,0 +1,4 @@
+build_x86_64/
+build_i686/
+*.o
+__pycache__/
