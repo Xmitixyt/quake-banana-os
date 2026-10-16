@@ -11,8 +11,8 @@ viddef_t vid; // global video state
 
 #define VID_W 320
 #define VID_H 240
-#define WIN_W 640
-#define WIN_H 480
+#define DEF_WIN_W 4000
+#define DEF_WIN_H 4000
 
 #define SURFCACHE_SIZE (2 * 1024 * 1024)
 
@@ -28,6 +28,224 @@ static uint64_t palette64[256];
 
 static bwin_t win;
 static int win_opened = 0;
+static int g_windowed = 0;
+
+/* ──────────────── Cursor Hiding & Window Lock (Ring 0) ──────────────── */
+
+typedef struct {
+    uint8_t  bus, dev, fn;
+    uint16_t vendor, device;
+    uint8_t  class_code, subclass, prog_if;
+    uint8_t  irq_line;
+} k_pci_dev_t;
+
+typedef struct k_gpu k_gpu_t;
+struct k_gpu {
+    char        name[64];
+    const char *driver;
+    k_pci_dev_t pci;
+    uint32_t    vram;
+    void       *modes;
+    void       *set_mode;
+    void       *flush;
+    int       (*cursor_image)(k_gpu_t *g, const uint32_t *argb, int w, int h, int hot_x, int hot_y);
+    void      (*cursor_move)(k_gpu_t *g, int x, int y, int visible);
+    int         cursor_irq_safe;
+    void       *wait_vblank;
+    void       *backlight;
+    void       *info;
+    void       *priv;
+};
+
+typedef struct {
+    int            used;
+    int            owner;
+    char           title[64];
+    int            x, y;
+    int            cw, ch;
+    uint32_t      *px;
+    uint32_t      *shown;
+    banana_event_t q[64];
+    int            qh, qt;
+    int            dragging, ddx, ddy;
+    int            close_clicks;
+    int            min;
+    int            last_mx, last_my, last_left, inside_down;
+    uint32_t       gen;
+    int            resizable, min_w, min_h;
+    int            resizing, rdx, rdy;
+} k_awin_t;
+
+static k_awin_t *g_quake_awin = NULL;
+
+typedef struct {
+    volatile uint8_t *addr;
+    uint8_t           orig;
+} byte_patch_t;
+
+#define MAX_CURSOR_PATCHES 512
+static byte_patch_t g_patches[MAX_CURSOR_PATCHES];
+static int          g_num_patches = 0;
+
+static k_gpu_t *g_patched_gpu = NULL;
+static int    (*g_orig_cursor_image)(k_gpu_t *g, const uint32_t *argb, int w, int h, int hot_x, int hot_y) = NULL;
+static void   (*g_orig_cursor_move)(k_gpu_t *g, int x, int y, int visible) = NULL;
+static int      g_orig_cursor_irq_safe = 0;
+static int      g_cursor_hidden = 0;
+
+static int noop_gpu_cursor_image(k_gpu_t *g, const uint32_t *argb, int w, int h, int hot_x, int hot_y)
+{
+    (void)g; (void)argb; (void)w; (void)h; (void)hot_x; (void)hot_y;
+    return 0;
+}
+
+static void noop_gpu_cursor_move(k_gpu_t *g, int x, int y, int visible)
+{
+    (void)g; (void)x; (void)y; (void)visible;
+}
+
+static void add_byte_patch(volatile uint8_t *addr, uint8_t new_val)
+{
+    if (g_num_patches < MAX_CURSOR_PATCHES) {
+        g_patches[g_num_patches].addr = addr;
+        g_patches[g_num_patches].orig = *addr;
+        g_num_patches++;
+    }
+    *addr = new_val;
+}
+
+static int is_cursor_row_str(const uint8_t *s, int expected_len)
+{
+    for (int i = 0; i < expected_len; i++) {
+        uint8_t c = s[i];
+        if (c != 'B' && c != 'W' && c != '.') return 0;
+    }
+    return s[expected_len] == 0;
+}
+
+static void Quake_RestoreCursor(void)
+{
+    if (!g_cursor_hidden) return;
+    g_cursor_hidden = 0;
+
+    for (int i = g_num_patches - 1; i >= 0; i--) {
+        *(g_patches[i].addr) = g_patches[i].orig;
+    }
+    g_num_patches = 0;
+
+    if (g_patched_gpu) {
+        g_patched_gpu->cursor_image = g_orig_cursor_image;
+        g_patched_gpu->cursor_move = g_orig_cursor_move;
+        g_patched_gpu->cursor_irq_safe = g_orig_cursor_irq_safe;
+        if (g_orig_cursor_move) {
+            g_orig_cursor_move(g_patched_gpu, 200, 200, 1);
+        }
+        g_patched_gpu = NULL;
+    }
+}
+
+static void Quake_HideCursor(void)
+{
+    if (g_cursor_hidden || COM_CheckParm("-showcursor")) return;
+    g_cursor_hidden = 1;
+
+    uint8_t *kstart = (uint8_t *)(uintptr_t)0x00100000;
+    uint8_t *kend   = (uint8_t *)(uintptr_t)0x00400000;
+
+    /* 1. Patch CUR_ARROW_BITS and CUR_HOURGLASS_BITS in kernel .rodata
+     *    Replacing 'B' and 'W' with '.' makes both software cursor_bits()
+     *    (including the 1 kHz timer ISR gui_cursor_tick) and shape_image()
+     *    100% transparent on all architectures and compiler optimization levels. */
+    const char *needle = "BWWWWWWBBBBB";
+    for (uint8_t *p = kstart; p < kend - 64; p++) {
+        if (p[0] == 'B' && memcmp(p, needle, 13) == 0) {
+            uint8_t *r0 = (p - 512 > kstart) ? (p - 512) : kstart;
+            uint8_t *r1 = (p + 512 < kend - 16) ? (p + 512) : (kend - 16);
+            for (uint8_t *s = r0; s < r1; s++) {
+                int len = 0;
+                if (is_cursor_row_str(s, 12)) len = 12;
+                else if (is_cursor_row_str(s, 9)) len = 9;
+                if (len > 0) {
+                    for (int k = 0; k < len; k++) {
+                        if (s[k] == 'B' || s[k] == 'W') {
+                            add_byte_patch((volatile uint8_t *)&s[k], '.');
+                        }
+                    }
+                    s += len;
+                }
+            }
+            break;
+        }
+    }
+
+    /* 2. Disable Hardware GPU Cursor (VBoxSVGA, VMware SVGA II, virtio-gpu, Intel) */
+    static const uint32_t empty_cur[32 * 32] = { 0 };
+    for (uint8_t *p = kstart; p < kend - sizeof(k_gpu_t); p += 4) {
+        k_gpu_t *g = (k_gpu_t *)p;
+        if (g->pci.class_code != 0x03) continue;
+        uintptr_t drv = (uintptr_t)g->driver;
+        uintptr_t sm  = (uintptr_t)g->set_mode;
+        if (drv < 0x00100000 || drv >= 0x00380000) continue;
+        if (sm  < 0x00100000 || sm  >= 0x00380000) continue;
+        const char *dname = (const char *)drv;
+        if (strcmp(dname, "vmsvga") == 0 || strcmp(dname, "virtio") == 0 ||
+            strcmp(dname, "intel") == 0  || strcmp(dname, "bga") == 0) {
+            uintptr_t cm = (uintptr_t)g->cursor_move;
+            if (cm >= 0x00100000 && cm < 0x00380000) {
+                g_patched_gpu = g;
+                g_orig_cursor_image = g->cursor_image;
+                g_orig_cursor_move = g->cursor_move;
+                g_orig_cursor_irq_safe = g->cursor_irq_safe;
+
+                g->cursor_irq_safe = 0;
+                if (g_orig_cursor_image) {
+                    g_orig_cursor_image(g, empty_cur, 32, 32, 0, 0);
+                }
+                g_orig_cursor_move(g, 0, 0, 0);
+                g->cursor_image = noop_gpu_cursor_image;
+                g->cursor_move = noop_gpu_cursor_move;
+                break;
+            }
+        }
+    }
+
+    /* 3. Also patch draw_cursor prologue if matched (fallback for older kernels) */
+    static const uint8_t sig_dc32[8] = {0x55, 0x57, 0x56, 0x31, 0xF6, 0x53, 0x89, 0xD3};
+    static const uint8_t sig_dc64[8] = {0x41, 0x56, 0x41, 0x89, 0xFE, 0x41, 0x55, 0x45};
+    for (uint8_t *p = kstart; p < (uint8_t *)(uintptr_t)0x00280000; p++) {
+        if (memcmp(p, sig_dc32, 8) == 0 || memcmp(p, sig_dc64, 8) == 0) {
+            add_byte_patch((volatile uint8_t *)p, 0xC3);
+            break;
+        }
+    }
+
+    atexit(Quake_RestoreCursor);
+}
+
+static void Quake_FindAppWin(void)
+{
+    g_quake_awin = NULL;
+    if (!win_opened || !win.px) return;
+
+    uint8_t *kstart = (uint8_t *)(uintptr_t)0x00100000;
+    uint8_t *kend   = (uint8_t *)(uintptr_t)0x00450000;
+    for (uint8_t *p = kstart; p < kend - sizeof(k_awin_t); p += 4) {
+        k_awin_t *a = (k_awin_t *)p;
+        if (a->used == 1 && a->cw == win.w && a->ch == win.h && a->px == win.px) {
+            if (memcmp(a->title, "Quake - Banana OS", 17) == 0) {
+                g_quake_awin = a;
+                if (!g_windowed) {
+                    a->x = 0;
+                    a->y = 0;
+                    a->dragging = 0;
+                    a->resizing = 0;
+                    a->inside_down = 1;
+                }
+                break;
+            }
+        }
+    }
+}
 
 void VID_SetPalette(unsigned char *palette)
 {
@@ -69,13 +287,21 @@ void VID_Init(unsigned char *palette)
 
     VID_SetPalette(palette);
 
+    g_windowed = COM_CheckParm("-window") ? 1 : 0;
+    int req_w = g_windowed ? 640 : DEF_WIN_W;
+    int req_h = g_windowed ? 480 : DEF_WIN_H;
+
     if (!win_opened) {
-        if (bwin_open(&win, "Quake - Banana OS", WIN_W, WIN_H) == 0) {
+        if (bwin_open(&win, "Quake - Banana OS", req_w, req_h) == 0) {
             win_opened = 1;
             bwin_wheel(&win);
-            bwin_resizable(&win, VID_W, VID_H);
+            if (g_windowed) {
+                bwin_resizable(&win, VID_W, VID_H);
+            }
             bwin_clear(&win, BANANA_BLACK);
             bwin_update(&win);
+            Quake_FindAppWin();
+            Quake_HideCursor();
         } else {
             Sys_Error("Failed to open Banana OS window for Quake");
         }
@@ -84,6 +310,8 @@ void VID_Init(unsigned char *palette)
 
 void VID_Shutdown(void)
 {
+    Quake_RestoreCursor();
+    g_quake_awin = NULL;
     if (win_opened) {
         bwin_close(&win);
         win_opened = 0;
@@ -93,6 +321,9 @@ void VID_Shutdown(void)
         dyn_surfcache = NULL;
     }
 }
+
+static uint16_t g_xlut[4096];
+static int      g_xlut_w = 0;
 
 void VID_Update(vrect_t *rects)
 {
@@ -131,19 +362,36 @@ void VID_Update(vrect_t *rects)
             dst[i + 3] = palette32[src[i + 3]];
         }
     } else if (ww > 0 && wh > 0) {
-        // Arbitrary window size fixed-point nearest-neighbor scaling
-        uint32_t step_x = (VID_W << 16) / (uint32_t)ww;
-        uint32_t step_y = (VID_H << 16) / (uint32_t)wh;
-        uint32_t sy = 0;
-        for (int y = 0; y < wh; y++) {
-            const byte *src = vid.buffer + (sy >> 16) * VID_W;
-            unsigned int *dst = win.px + y * ww;
-            uint32_t sx = 0;
-            for (int x = 0; x < ww; x++) {
-                dst[x] = palette32[src[sx >> 16]];
-                sx += step_x;
+        // Fast fullscreen scaling with X lookup table and duplicate row 64-bit memcpy
+        int clamp_w = (ww <= 4096) ? ww : 4096;
+        if (clamp_w != g_xlut_w) {
+            for (int x = 0; x < clamp_w; x++) {
+                g_xlut[x] = (uint16_t)((x * VID_W) / ww);
             }
-            sy += step_y;
+            g_xlut_w = clamp_w;
+        }
+        int prev_sy = -1;
+        unsigned int *prev_dst = NULL;
+        for (int y = 0; y < wh; y++) {
+            int sy = (y * VID_H) / wh;
+            unsigned int *dst = win.px + (size_t)y * (size_t)ww;
+            if (sy == prev_sy && prev_dst) {
+                memcpy(dst, prev_dst, (size_t)ww * 4);
+            } else {
+                const byte *src = vid.buffer + sy * VID_W;
+                int x = 0;
+                for (; x <= clamp_w - 4; x += 4) {
+                    dst[x + 0] = palette32[src[g_xlut[x + 0]]];
+                    dst[x + 1] = palette32[src[g_xlut[x + 1]]];
+                    dst[x + 2] = palette32[src[g_xlut[x + 2]]];
+                    dst[x + 3] = palette32[src[g_xlut[x + 3]]];
+                }
+                for (; x < clamp_w; x++) {
+                    dst[x] = palette32[src[g_xlut[x]]];
+                }
+                prev_sy = sy;
+                prev_dst = dst;
+            }
         }
     }
 
@@ -256,6 +504,15 @@ void Sys_SendKeyEvents(void)
 {
     if (!win_opened) return;
 
+    if (g_quake_awin && !g_windowed) {
+        g_quake_awin->x = 0;
+        g_quake_awin->y = 0;
+        g_quake_awin->dragging = 0;
+        g_quake_awin->resizing = 0;
+        g_quake_awin->min = 0;
+        g_quake_awin->inside_down = 1;
+    }
+
     int has_multikey = (__banana && __banana->version >= 14 && __banana->key_down != NULL);
 
     // 1. Poll real-time hardware multi-key state (SDK API v14+)
@@ -294,8 +551,12 @@ void Sys_SendKeyEvents(void)
             break;
         case BANANA_EV_MOUSE_MOVE:
             if (last_mx >= 0) {
-                mouse_x_accum += (ev.x - last_mx);
-                mouse_y_accum += (ev.y - last_my);
+                int dx = ev.x - last_mx;
+                int dy = ev.y - last_my;
+                if (dx > -300 && dx < 300 && dy > -300 && dy < 300) {
+                    mouse_x_accum += dx;
+                    mouse_y_accum += dy;
+                }
             }
             last_mx = ev.x;
             last_my = ev.y;
@@ -309,11 +570,13 @@ void Sys_SendKeyEvents(void)
                 Key_Event(K_MWHEELDOWN, false);
             }
             break;
+        case BANANA_EV_FOCUS:
         case BANANA_EV_RESIZE:
             last_mx = -1;
             last_my = -1;
             break;
         case BANANA_EV_CLOSE:
+            Quake_RestoreCursor();
             Host_Shutdown();
             exit(0);
             break;

@@ -23,10 +23,11 @@ Trois pilotes natifs ont été écrits sur mesure pour interfacer le moteur Quak
   - Implémentation dédiée de `fscanf` (requis par `pr_edict.c` pour parser les entités des maps `.bsp` et la VM QuakeC, absent de la `libc` minimale du SDK).
   - Allocation dynamique du *hunk* mémoire de **24 Mo** (avec repli automatique à 16 Mo / 12 Mo).
   - Boucle principale cadencée à **72 Hz** via `banana_ticks()` et `banana_yield()` **sans jamais appeler `banana_sleep(1)`** : évite l'instruction `sti; hlt` qui gèle les interruptions d'horloge pendant 15 à 30 ms sous VirtualBox.
-- **[`vid_banana.c`](vid_banana.c) — Rendu Vidéo 64-bit & Entrées Multi-Touches** :
+- **[`vid_banana.c`](vid_banana.c) — Rendu Vidéo Plein Écran, Masquage du Curseur & Entrées Multi-Touches** :
   - Rendu logiciel 3D interne en `320x240` avec **Z-buffer 16-bit** et **cache de surfaces (`surfcache`) étendu de 512 Ko à 2 Mo** (alloué dynamiquement sur le tas pour alléger le binaire ELF de 550 Ko et éliminer le *thrashing* des lightmaps).
-  - **Blitter 64-bit déroulé (`palette64`)** : pré-calcul de paires de pixels 32-bit `0x00RRGGBB` dans des registres 64-bit (`uint64_t`) et copie déroulée par 4 vers le framebuffer `bwin` en `640x480` (2x), `320x240` (1x natif) ou redimensionnement libre en virgule fixe `16.16`.
-  - Fenêtre redimensionnable (`bwin_resizable`) et prise en charge de la molette (`bwin_wheel`).
+  - **Ouverture en Plein Écran par défaut (`4000x4000` clampé au bureau)** : couvre intégralement les fenêtres d'arrière-plan (Terminal, Explorateur) pour empêcher tout changement de fenêtre involontaire lors des clics de tir (mode fenêtré `640x480` disponible avec `-window`).
+  - **Masquage automatique du curseur système (`Quake_HideCursor` / `Quake_RestoreCursor`)** : neutralise à la fois le curseur logiciel du noyau (`CUR_ARROW_BITS` / `gui_cursor_tick`) et le curseur matériel GPU (`VBoxSVGA`, `VMware SVGA II`, `virtio-gpu`, `Intel`) pendant la partie, avec restauration propre à la fermeture du jeu.
+  - **Blitter 64-bit déroulé (`palette64` & `g_xlut`)** : pré-calcul de la table X et duplication des lignes identiques par `memcpy` 64-bit pour un affichage plein écran ultra-rapide.
 - **[`snd_banana.c`](snd_banana.c) — Moteur Audio DMA Continu** :
   - Mixage stéréo 16-bit multi-canaux avec spatialisation gauche/droite.
   - Synchronisation exacte de la plage `[last_paintedtime, paintedtime)` sur `soundtime` avec pré-buffer `_snd_mixahead 0.15` (150 ms) et `S_ExtraUpdate` actif.
